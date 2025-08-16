@@ -282,9 +282,12 @@ def DFLieee141(wind_power,sunny_power):
     pi_G=10
     pi_T=20
     pi_P=100
+    pi_curtail=50
 
     net=ieee141()
 
+    original_wind_total = wind_power * 8  # 3个风电节点
+    original_solar_total = sunny_power * 8  # 3个太阳能节点
     #UG
     # uncertain_load_buses = [ 8,  12,  25,  28,  36,  38, 42,  46,  50,  54,  58,  60,
     # 64,  68,  70,  72,  74,  76,  78,  80,  82,  84,  85,  88,
@@ -325,20 +328,39 @@ def DFLieee141(wind_power,sunny_power):
         pp.create_storage(net, bus=bus-1, p_mw=0.0, max_e_mwh=1.0, soc_percent=50,
                       q_mvar=0.0, min_e_mwh=0.0, name=f"Storage_{bus}")
     
+    ## 新增：计算弃风弃光惩罚项
+    # 获取实际发出的可再生能源功率
+    wind_sgen_indices = [i for i, name in enumerate(net.sgen['name']) if 'Wind' in str(name)]
+    solar_sgen_indices = [i for i, name in enumerate(net.sgen['name']) if 'Solar' in str(name)]
     
+    actual_wind_total = net.res_sgen.iloc[wind_sgen_indices]['p_mw'].sum()
+    actual_solar_total = net.res_sgen.iloc[solar_sgen_indices]['p_mw'].sum()
+
+    # print(original_wind_total)
+    # print(original_solar_total)
+    # print(actual_solar_total)
+    # print(actual_wind_total)
+
+    # 计算弃风弃光量
+    wind_curtailment = max(0, original_wind_total - actual_wind_total)
+    solar_curtailment = max(0, original_solar_total - actual_solar_total)
+    total_curtailment = wind_curtailment + solar_curtailment
+
 
     #Cost
     total_dg_mw = net.res_sgen['p_mw'].sum()
     total_grid_mw = net.res_ext_grid['p_mw'].sum()
     vm_pu = net.res_bus['vm_pu']
-    voltage_violations = np.maximum(0, vm_pu - net.bus["max_vm_pu"]) + np.maximum(0, net.bus["min_vm_pu"] - vm_pu)
-    cp = pi_P * voltage_violations.sum()
+    # voltage_violations = np.maximum(0, vm_pu - net.bus["max_vm_pu"]) + np.maximum(0, net.bus["min_vm_pu"] - vm_pu)
+    # cp = pi_P * voltage_violations.sum()
 
     # print("voltage cost",cp)
     # print(total_dg_mw)
     # print(total_grid_mw)
+
+    curtailment_penalty = pi_curtail * total_curtailment
     
-    total_cost = total_dg_mw * pi_G + total_grid_mw * pi_T+cp
+    total_cost = total_dg_mw * pi_G + total_grid_mw * pi_T+curtailment_penalty
     
     return total_cost,vm_pu  
 
