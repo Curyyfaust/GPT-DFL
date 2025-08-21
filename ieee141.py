@@ -278,92 +278,133 @@ def ieee141():
     return net
 
 
-def DFLieee141(wind_power,sunny_power):
-    pi_G=10
-    pi_T=20
-    pi_P=100
-    pi_curtail=50
+def DFLieee141(wind_power, sunny_power, voltage_tolerance=0.05):
+    pi_G = 10
+    pi_T = 20
+    pi_P = 100
+    pi_curtail = 50
 
-    net=ieee141()
+    net = ieee141()
 
-    original_wind_total = wind_power * 8  # 3个风电节点
-    original_solar_total = sunny_power * 8  # 3个太阳能节点
-    #UG
-    # uncertain_load_buses = [ 8,  12,  25,  28,  36,  38, 42,  46,  50,  54,  58,  60,
-    # 64,  68,  70,  72,  74,  76,  78,  80,  82,  84,  85,  88,
-    # 90,  92,  96, 100, 102, 110, 112, 114, 116, 120, 122, 123] #36stations
-    # uncertain_bus_indices = [bus - 1 for bus in uncertain_load_buses]
+    # 记录原始可再生能源容量
+    original_wind_total = wind_power * 8  # 8个风电节点
+    original_solar_total = sunny_power * 8  # 8个太阳能节点
     
-    # q_p_ratio = 0.6
-    # predicted_q_mvar = [p * q_p_ratio for p in predicted_p_mw]
-    # for i, bus in enumerate(uncertain_bus_indices):
-    #     idx = net.load[net.load['bus'] == bus].index
-    #     if not idx.empty:
-    #         net.load.at[idx[0], 'p_mw'] = predicted_p_mw[i]
-    #         net.load.at[idx[0], 'q_mvar'] = predicted_q_mvar[i]
-    
-    #风电
-    wind_buses =  [8, 28, 42, 54, 70, 80, 90, 110]
+    # 每个节点功率相同
+    # 风电 - 设置为可控制的静态发电机
+    wind_buses = [8, 28, 42, 54, 70, 80, 90, 110]
     for bus in wind_buses:
-        pp.create_sgen(net, bus=bus-1, p_mw=wind_power, q_mvar=0.0, name=f"Wind_{bus}")
+        pp.create_sgen(net, bus=bus-1, p_mw=wind_power, q_mvar=0.0, 
+                      controllable=True, max_p_mw=wind_power, min_p_mw=0.0,
+                      name=f"Wind_{bus}")
 
-    #太阳能
+    # 太阳能 - 设置为可控制的静态发电机
     solar_buses = [12, 36, 50, 64, 76, 84, 96, 122]
     for i, bus in enumerate(solar_buses):
-        pp.create_sgen(net, bus=bus-1, p_mw=sunny_power, q_mvar=0.0, name=f"Solar_{bus}")
+        pp.create_sgen(net, bus=bus-1, p_mw=sunny_power, q_mvar=0.0,
+                      controllable=True, max_p_mw=sunny_power, min_p_mw=0.0,
+                      name=f"Solar_{bus}")
 
-
-    #DG
+    # DG 发电机
     dg_buses = [10, 32, 45, 57, 69, 84, 98, 117]
     dg_bus_indices = [bus - 1 for bus in dg_buses]
     for i in dg_bus_indices:
         pp.create_sgen(net, bus=i, p_mw=1.0, q_mvar=0.0, name=f"DG at Bus {i+1}")
-        
-    #潮流计算
-    pp.runpp(net, max_iteration=30, init='auto', tolerance_mva=1e-3, calculate_voltage_angles=True)
 
-    #储能
+    # 储能
     storage_buses = [10, 25, 40, 55, 70, 85, 100, 120]
     for bus in storage_buses:
         pp.create_storage(net, bus=bus-1, p_mw=0.0, max_e_mwh=1.0, soc_percent=50,
-                      q_mvar=0.0, min_e_mwh=0.0, name=f"Storage_{bus}")
+                          q_mvar=0.0, min_e_mwh=0.0, name=f"Storage_{bus}")
+
+    # 松弛后的电压限制 - 增加容忍度
+    min_voltage = 0.95 - voltage_tolerance  # 默认 0.90
+    max_voltage = 1.15 + voltage_tolerance  # 默认 1.20
     
-    ## 新增：计算弃风弃光惩罚项
-    # 获取实际发出的可再生能源功率
+    net.bus["min_vm_pu"] = min_voltage
+    net.bus["max_vm_pu"] = max_voltage
+
+    # 运行潮流计算
+    try:
+        pp.runpp(net, max_iteration=30, init='auto', tolerance_mva=1e-3, calculate_voltage_angles=True)
+        
+        # 使用松弛后的电压约束检查
+        vm_pu = net.res_bus['vm_pu']
+        voltage_violations = ((vm_pu < min_voltage) | (vm_pu > max_voltage)).any()
+        
+        if voltage_violations or not net.converged:
+            # 逐步削减可再生能源直到电压满足松弛后的约束
+            curtailment_factor = 1.0
+            while (voltage_violations or not net.converged) and curtailment_factor > 0.1:
+                curtailment_factor -= 0.05
+                
+                # 重新创建网络
+                net = ieee141()
+                
+                # 应用削减后的风电
+                for bus in wind_buses:
+                    pp.create_sgen(net, bus=bus-1, p_mw=wind_power*curtailment_factor, 
+                                  q_mvar=0.0, name=f"Wind_{bus}")
+                
+                # 应用削减后的太阳能
+                for i, bus in enumerate(solar_buses):
+                    pp.create_sgen(net, bus=bus-1, p_mw=sunny_power*curtailment_factor, 
+                                  q_mvar=0.0, name=f"Solar_{bus}")
+                
+                # DG 发电机
+                for i in dg_bus_indices:
+                    pp.create_sgen(net, bus=i, p_mw=1.0, q_mvar=0.0, name=f"DG at Bus {i+1}")
+                
+                # 储能
+                for bus in storage_buses:
+                    pp.create_storage(net, bus=bus-1, p_mw=0.0, max_e_mwh=1.0, soc_percent=50,
+                                      q_mvar=0.0, min_e_mwh=0.0, name=f"Storage_{bus}")
+                
+                # 松弛后的电压限制
+                net.bus["min_vm_pu"] = min_voltage
+                net.bus["max_vm_pu"] = max_voltage
+                
+                try:
+                    pp.runpp(net, max_iteration=30, init='auto', tolerance_mva=1e-3, calculate_voltage_angles=True)
+                    vm_pu = net.res_bus['vm_pu']
+                    voltage_violations = ((vm_pu < min_voltage) | (vm_pu > max_voltage)).any()
+                except:
+                    voltage_violations = True
+                    net.converged = False
+                    
+    except:
+        pass
+
+    # 计算实际发出的可再生能源功率
     wind_sgen_indices = [i for i, name in enumerate(net.sgen['name']) if 'Wind' in str(name)]
     solar_sgen_indices = [i for i, name in enumerate(net.sgen['name']) if 'Solar' in str(name)]
     
     actual_wind_total = net.res_sgen.iloc[wind_sgen_indices]['p_mw'].sum()
     actual_solar_total = net.res_sgen.iloc[solar_sgen_indices]['p_mw'].sum()
 
-    # print(original_wind_total)
-    # print(original_solar_total)
-    # print(actual_solar_total)
-    # print(actual_wind_total)
-
     # 计算弃风弃光量
     wind_curtailment = max(0, original_wind_total - actual_wind_total)
     solar_curtailment = max(0, original_solar_total - actual_solar_total)
     total_curtailment = wind_curtailment + solar_curtailment
 
-
-    #Cost
-    total_dg_mw = net.res_sgen['p_mw'].sum()
+    # 成本计算
+    dg_sgen_indices = [i for i, name in enumerate(net.sgen['name']) if 'DG' in str(name)]
+    total_dg_mw = net.res_sgen.iloc[dg_sgen_indices]['p_mw'].sum()
     total_grid_mw = net.res_ext_grid['p_mw'].sum()
     vm_pu = net.res_bus['vm_pu']
-    # voltage_violations = np.maximum(0, vm_pu - net.bus["max_vm_pu"]) + np.maximum(0, net.bus["min_vm_pu"] - vm_pu)
-    # cp = pi_P * voltage_violations.sum()
 
-    # print("voltage cost",cp)
-    # print(total_dg_mw)
-    # print(total_grid_mw)
-
+    # 弃风弃光惩罚成本
     curtailment_penalty = pi_curtail * total_curtailment
     
-    total_cost = total_dg_mw * pi_G + total_grid_mw * pi_T+curtailment_penalty
-    
-    return total_cost,vm_pu  
+    # 总成本 = DG成本 + 主网成本 + 弃风弃光惩罚成本
+    total_cost = total_dg_mw * pi_G + total_grid_mw * pi_T + curtailment_penalty
 
+    # 计算新能源消纳率
+    total_renewable_capacity = original_wind_total + original_solar_total
+    total_renewable_output = actual_wind_total + actual_solar_total
+    renewable_utilization_rate = (total_renewable_output / total_renewable_capacity * 100) if total_renewable_capacity > 0 else 0
+
+    return total_cost, vm_pu
 
 if __name__ == "__main__":
     predicted_p_mw = [
